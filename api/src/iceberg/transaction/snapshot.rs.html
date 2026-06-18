@@ -508,20 +508,4 @@
 <a href=#508 id=508 data-nosnippet>508</a>        <span class="prelude-val">Ok</span>(ActionCommit::new(updates, requirements))
 <a href=#509 id=509 data-nosnippet>509</a>    }
 <a href=#510 id=510 data-nosnippet>510</a>}
-<a href=#511 id=511 data-nosnippet>511</a>
-<a href=#512 id=512 data-nosnippet>512</a><span class="kw">pub</span>(<span class="kw">super</span>) <span class="kw">fn </span>check_no_duplicate_paths_in_batch(files: <span class="kw-2">&amp;</span>[DataFile]) -&gt; <span class="prelude-ty">Result</span>&lt;()&gt; {
-<a href=#513 id=513 data-nosnippet>513</a>    <span class="kw">let </span><span class="kw-2">mut </span>seen: HashSet&lt;<span class="kw-2">&amp;</span>str&gt; = HashSet::with_capacity(files.len());
-<a href=#514 id=514 data-nosnippet>514</a>    <span class="kw">for </span>f <span class="kw">in </span>files {
-<a href=#515 id=515 data-nosnippet>515</a>        <span class="macro">if !</span>seen.insert(f.file_path.as_str()) {
-<a href=#516 id=516 data-nosnippet>516</a>            <span class="kw">return </span><span class="prelude-val">Err</span>(Error::new(
-<a href=#517 id=517 data-nosnippet>517</a>                ErrorKind::DataInvalid,
-<a href=#518 id=518 data-nosnippet>518</a>                <span class="macro">format!</span>(
-<a href=#519 id=519 data-nosnippet>519</a>                    <span class="string">"Cannot add duplicate file path within the same commit: {}"</span>,
-<a href=#520 id=520 data-nosnippet>520</a>                    f.file_path
-<a href=#521 id=521 data-nosnippet>521</a>                ),
-<a href=#522 id=522 data-nosnippet>522</a>            ));
-<a href=#523 id=523 data-nosnippet>523</a>        }
-<a href=#524 id=524 data-nosnippet>524</a>    }
-<a href=#525 id=525 data-nosnippet>525</a>    <span class="prelude-val">Ok</span>(())
-<a href=#526 id=526 data-nosnippet>526</a>}
 </code></pre></div></section></main></body></html>
