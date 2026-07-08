@@ -17,7 +17,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
-use std::ops::RangeFrom;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use futures::TryStreamExt;
 use futures::stream::FuturesUnordered;
@@ -114,21 +114,27 @@ pub(crate) trait SnapshotProduceOperation: Send + Sync {
 pub(crate) struct DefaultManifestProcess;
 
 impl ManifestProcess for DefaultManifestProcess {
-    fn process_manifests(
+    async fn process_manifests(
         &self,
         _snapshot_produce: &SnapshotProducer<'_>,
         manifests: Vec<ManifestFile>,
-    ) -> Vec<ManifestFile> {
-        manifests
+    ) -> Result<Vec<ManifestFile>> {
+        Ok(manifests)
     }
 }
 
+/// A hook that transforms the set of manifest files included in a new snapshot.
+///
+/// Implementations may rewrite manifests entirely (e.g. manifest compaction),
+/// which requires reading and writing manifest files, so the hook fallible.
+/// Writers for new manifests can be obtained from the [`SnapshotProducer`]
+/// passed to the hook.
 pub(crate) trait ManifestProcess: Send + Sync {
     fn process_manifests(
         &self,
         snapshot_produce: &SnapshotProducer<'_>,
         manifests: Vec<ManifestFile>,
-    ) -> Vec<ManifestFile>;
+    ) -> impl Future<Output = Result<Vec<ManifestFile>>> + Send;
 }
 
 pub(crate) struct SnapshotProducer<'a> {
@@ -140,8 +146,8 @@ pub(crate) struct SnapshotProducer<'a> {
     added_data_files: Vec<DataFile>,
     // A counter used to generate unique manifest file names.
     // It starts from 0 and increments for each new manifest file.
-    // Note: This counter is limited to the range of (0..u64::MAX).
-    manifest_counter: RangeFrom<u64>,
+    // Atomic so that writers can be created through a shared reference.
+    manifest_counter: AtomicU64,
 }
 
 impl<'a> SnapshotProducer<'a> {
@@ -159,7 +165,7 @@ impl<'a> SnapshotProducer<'a> {
             key_metadata,
             snapshot_properties,
             added_data_files,
-            manifest_counter: (0..),
+            manifest_counter: AtomicU64::new(0),
         }
     }
 
@@ -242,13 +248,16 @@ impl<'a> SnapshotProducer<'a> {
         Ok(())
     }
 
-    fn new_manifest_writer(&mut self, content: ManifestContentType) -> Result<ManifestWriter> {
+    pub(crate) fn new_manifest_writer(
+        &self,
+        content: ManifestContentType,
+    ) -> Result<ManifestWriter> {
         let new_manifest_path = format!(
             "{}/{}/{}-m{}.{}",
             self.table.metadata().location(),
             META_ROOT_PATH,
             self.commit_uuid,
-            self.manifest_counter.next().unwrap(),
+            self.manifest_counter.fetch_add(1, Ordering::Relaxed),
             DataFileFormat::Avro
         );
         let output_file = self.table.file_io().new_output(new_manifest_path)?;
@@ -367,7 +376,9 @@ impl<'a> SnapshotProducer<'a> {
         // # TODO
         // Support process delete entries.
 
-        let manifest_files = manifest_process.process_manifests(self, manifest_files);
+        let manifest_files = manifest_process
+            .process_manifests(self, manifest_files)
+            .await?;
         Ok(manifest_files)
     }
 
