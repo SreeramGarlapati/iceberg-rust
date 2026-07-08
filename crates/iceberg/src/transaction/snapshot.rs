@@ -118,23 +118,38 @@ impl ManifestProcess for DefaultManifestProcess {
         &self,
         _snapshot_produce: &SnapshotProducer<'_>,
         manifests: Vec<ManifestFile>,
-    ) -> Result<Vec<ManifestFile>> {
-        Ok(manifests)
+    ) -> Result<ProcessedManifests> {
+        Ok(ProcessedManifests {
+            manifests,
+            summary_properties: HashMap::new(),
+        })
     }
+}
+
+/// The output of [`ManifestProcess::process_manifests`].
+pub(crate) struct ProcessedManifests {
+    /// Manifest files to include in the new snapshot.
+    pub(crate) manifests: Vec<ManifestFile>,
+    /// Summary properties describing the processing (e.g. `manifests-created`
+    /// for a manifest rewrite). Merged into the snapshot summary with
+    /// precedence over user-supplied snapshot properties and metrics derived
+    /// from added data files.
+    pub(crate) summary_properties: HashMap<String, String>,
 }
 
 /// A hook that transforms the set of manifest files included in a new snapshot.
 ///
 /// Implementations may rewrite manifests entirely (e.g. manifest compaction),
-/// which requires reading and writing manifest files, so the hook fallible.
+/// which requires reading and writing manifest files, so the hook is fallible.
 /// Writers for new manifests can be obtained from the [`SnapshotProducer`]
-/// passed to the hook.
+/// passed to the hook. Metrics describing the processing are reported back
+/// through [`ProcessedManifests::summary_properties`].
 pub(crate) trait ManifestProcess: Send + Sync {
     fn process_manifests(
         &self,
         snapshot_produce: &SnapshotProducer<'_>,
         manifests: Vec<ManifestFile>,
-    ) -> impl Future<Output = Result<Vec<ManifestFile>>> + Send;
+    ) -> impl Future<Output = Result<ProcessedManifests>> + Send;
 }
 
 pub(crate) struct SnapshotProducer<'a> {
@@ -351,7 +366,7 @@ impl<'a> SnapshotProducer<'a> {
         &mut self,
         snapshot_produce_operation: &OP,
         manifest_process: &MP,
-    ) -> Result<Vec<ManifestFile>> {
+    ) -> Result<ProcessedManifests> {
         // Assert current snapshot producer contains new content to add to new snapshot.
         //
         // TODO: Allowing snapshot property setup with no added data files is a workaround.
@@ -376,17 +391,14 @@ impl<'a> SnapshotProducer<'a> {
         // # TODO
         // Support process delete entries.
 
-        let manifest_files = manifest_process
+        manifest_process
             .process_manifests(self, manifest_files)
-            .await?;
-        Ok(manifest_files)
+            .await
     }
 
-    // Returns a `Summary` of the current snapshot
-    fn summary<OP: SnapshotProduceOperation>(
-        &self,
-        snapshot_produce_operation: &OP,
-    ) -> Result<Summary> {
+    // Returns summary derived from the data files added in this snapshot. Must
+    // be called before manifest production, which consumes `self.added_data_files`.
+    fn added_files_summary_properties(&self) -> HashMap<String, String> {
         let mut summary_collector = SnapshotSummaryCollector::default();
         let table_metadata = self.table.metadata_ref();
 
@@ -413,15 +425,34 @@ impl<'a> SnapshotProducer<'a> {
             );
         }
 
-        let previous_snapshot = table_metadata.current_snapshot();
+        summary_collector.build()
+    }
 
-        let mut additional_properties = summary_collector.build();
-        additional_properties.extend(self.snapshot_properties.clone());
+    // Assembles the `Summary` of the new snapshot. Properties are merged with
+    // increasing precedence:
+    // - user-supplied snapshot properties
+    // - properties derived from added data files
+    // - properties reported by process_manifest
+    // - totals calculated from previous summaries
+    // Computed values overwrite colliding user-supplied keys, so a user cannot
+    // shadow them with a bad value that would corrupt the  snapshot summary.
+    fn summary<OP: SnapshotProduceOperation>(
+        &self,
+        snapshot_produce_operation: &OP,
+        added_files_summary: HashMap<String, String>,
+        process_summary: HashMap<String, String>,
+    ) -> Result<Summary> {
+        let mut additional_properties = self.snapshot_properties.clone();
+        additional_properties.extend(added_files_summary);
+        additional_properties.extend(process_summary);
 
         let summary = Summary {
             operation: snapshot_produce_operation.operation(),
             additional_properties,
         };
+
+        let table_metadata = self.table.metadata_ref();
+        let previous_snapshot = table_metadata.current_snapshot();
 
         update_snapshot_summaries(
             summary,
@@ -478,16 +509,19 @@ impl<'a> SnapshotProducer<'a> {
             ),
         };
 
-        // Calling self.summary() before self.manifest_file() is important because self.added_data_files
-        // will be set to an empty vec after self.manifest_file() returns, resulting in an empty summary
-        // being generated.
-        let summary = self.summary(&snapshot_produce_operation).map_err(|err| {
-            Error::new(ErrorKind::Unexpected, "Failed to create snapshot summary.").with_source(err)
-        })?;
-
-        let new_manifests = self
+        // Metrics for the added data files must be captured before manifest
+        // production, which consumes `self.added_data_files`.
+        let added_files_summary = self.added_files_summary_properties();
+        let new_processed_manifests = self
             .manifest_file(&snapshot_produce_operation, &process)
             .await?;
+        let new_manifests = new_processed_manifests.manifests;
+
+        let summary = self.summary(
+            &snapshot_produce_operation,
+            added_files_summary,
+            new_processed_manifests.summary_properties,
+        )?;
 
         manifest_list_writer.add_manifests(new_manifests.into_iter())?;
         let writer_next_row_id = manifest_list_writer.next_row_id();
@@ -536,5 +570,102 @@ impl<'a> SnapshotProducer<'a> {
         ];
 
         Ok(ActionCommit::new(updates, requirements))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::spec::{DataContentType, DataFileBuilder, Literal};
+    use crate::transaction::tests::make_v2_minimal_table;
+
+    struct AppendTestOperation;
+
+    impl SnapshotProduceOperation for AppendTestOperation {
+        fn operation(&self) -> Operation {
+            Operation::Append
+        }
+
+        async fn delete_entries(
+            &self,
+            _snapshot_produce: &SnapshotProducer<'_>,
+        ) -> Result<Vec<ManifestEntry>> {
+            Ok(vec![])
+        }
+
+        async fn existing_manifest(
+            &self,
+            _snapshot_produce: &SnapshotProducer<'_>,
+        ) -> Result<Vec<ManifestFile>> {
+            Ok(vec![])
+        }
+    }
+
+    /// A manifest process that reports summary properties, mimicking a
+    /// rewrite-style operation whose metrics are only known after processing.
+    struct SummaryReportingProcess;
+
+    impl ManifestProcess for SummaryReportingProcess {
+        async fn process_manifests(
+            &self,
+            _snapshot_produce: &SnapshotProducer<'_>,
+            manifests: Vec<ManifestFile>,
+        ) -> Result<ProcessedManifests> {
+            Ok(ProcessedManifests {
+                manifests,
+                summary_properties: HashMap::from([
+                    ("manifests-created".to_string(), "7".to_string()),
+                    ("shared-key".to_string(), "process-value".to_string()),
+                ]),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_process_summary_properties_reach_snapshot_summary() {
+        let table = make_v2_minimal_table();
+        let data_file = DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path("test/1.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(100)
+            .record_count(1)
+            .partition_spec_id(table.metadata().default_partition_spec_id())
+            .partition(Struct::from_iter([Some(Literal::long(300))]))
+            .build()
+            .unwrap();
+
+        let snapshot_properties = HashMap::from([
+            ("user-key".to_string(), "user-value".to_string()),
+            // Colliding keys must lose to computed metrics and to
+            // process-reported properties respectively.
+            ("added-data-files".to_string(), "999".to_string()),
+            ("shared-key".to_string(), "user-value".to_string()),
+        ]);
+        let producer =
+            SnapshotProducer::new(&table, Uuid::now_v7(), None, snapshot_properties, vec![
+                data_file,
+            ]);
+
+        let mut action_commit = producer
+            .commit(AppendTestOperation, SummaryReportingProcess)
+            .await
+            .unwrap();
+        let updates = action_commit.take_updates();
+        let TableUpdate::AddSnapshot { snapshot } = &updates[0] else {
+            panic!("first update should be AddSnapshot");
+        };
+        let props = &snapshot.summary().additional_properties;
+
+        // Properties reported by the manifest process are included.
+        assert_eq!(props.get("manifests-created").unwrap(), "7");
+        // Non-colliding user properties are preserved.
+        assert_eq!(props.get("user-key").unwrap(), "user-value");
+        // Computed metrics overwrite colliding user-supplied values.
+        assert_eq!(props.get("added-data-files").unwrap(), "1");
+        // Process-reported properties overwrite colliding user-supplied values.
+        assert_eq!(props.get("shared-key").unwrap(), "process-value");
+        // Totals are derived against the fully-assembled property map.
+        assert_eq!(props.get("total-data-files").unwrap(), "1");
     }
 }
