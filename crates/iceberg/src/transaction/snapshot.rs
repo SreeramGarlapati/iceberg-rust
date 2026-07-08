@@ -119,10 +119,7 @@ impl ManifestProcess for DefaultManifestProcess {
         _snapshot_produce: &SnapshotProducer<'_>,
         manifests: Vec<ManifestFile>,
     ) -> Result<ProcessedManifests> {
-        Ok(ProcessedManifests {
-            manifests,
-            summary_properties: HashMap::new(),
-        })
+        Ok(ProcessedManifests::new(manifests))
     }
 }
 
@@ -135,6 +132,23 @@ pub(crate) struct ProcessedManifests {
     /// precedence over user-supplied snapshot properties and metrics derived
     /// from added data files.
     pub(crate) summary_properties: HashMap<String, String>,
+}
+
+impl ProcessedManifests {
+    /// Creates a `ProcessedManifests` with no summary properties.
+    pub(crate) fn new(manifests: Vec<ManifestFile>) -> Self {
+        Self {
+            manifests,
+            summary_properties: HashMap::new(),
+        }
+    }
+
+    /// Adds a summary property describing the processing.
+    pub(crate) fn with_property(mut self, key: &str, value: impl ToString) -> Self {
+        self.summary_properties
+            .insert(key.to_string(), value.to_string());
+        self
+    }
 }
 
 /// A hook that transforms the set of manifest files included in a new snapshot.

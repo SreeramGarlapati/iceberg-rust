@@ -25,28 +25,33 @@ use crate::{Error, ErrorKind, Result};
 
 const ADDED_DATA_FILES: &str = "added-data-files";
 const ADDED_DELETE_FILES: &str = "added-delete-files";
+const ADDED_EQUALITY_DELETE_FILES: &str = "added-equality-delete-files";
 const ADDED_EQUALITY_DELETES: &str = "added-equality-deletes";
 const ADDED_FILE_SIZE: &str = "added-files-size";
-const ADDED_POSITION_DELETES: &str = "added-position-deletes";
 const ADDED_POSITION_DELETE_FILES: &str = "added-position-delete-files";
+const ADDED_POSITION_DELETES: &str = "added-position-deletes";
 const ADDED_RECORDS: &str = "added-records";
-const DELETED_DATA_FILES: &str = "deleted-data-files";
-const DELETED_RECORDS: &str = "deleted-records";
-const ADDED_EQUALITY_DELETE_FILES: &str = "added-equality-delete-files";
-const REMOVED_DELETE_FILES: &str = "removed-delete-files";
-const REMOVED_EQUALITY_DELETES: &str = "removed-equality-deletes";
-const REMOVED_EQUALITY_DELETE_FILES: &str = "removed-equality-delete-files";
-const REMOVED_FILE_SIZE: &str = "removed-files-size";
-const REMOVED_POSITION_DELETES: &str = "removed-position-deletes";
-const REMOVED_POSITION_DELETE_FILES: &str = "removed-position-delete-files";
-const TOTAL_EQUALITY_DELETES: &str = "total-equality-deletes";
-const TOTAL_POSITION_DELETES: &str = "total-position-deletes";
-const TOTAL_DATA_FILES: &str = "total-data-files";
-const TOTAL_DELETE_FILES: &str = "total-delete-files";
-const TOTAL_RECORDS: &str = "total-records";
-const TOTAL_FILE_SIZE: &str = "total-files-size";
 const CHANGED_PARTITION_COUNT_PROP: &str = "changed-partition-count";
 const CHANGED_PARTITION_PREFIX: &str = "partitions.";
+const DELETED_DATA_FILES: &str = "deleted-data-files";
+const DELETED_RECORDS: &str = "deleted-records";
+const REMOVED_DELETE_FILES: &str = "removed-delete-files";
+const REMOVED_EQUALITY_DELETE_FILES: &str = "removed-equality-delete-files";
+const REMOVED_EQUALITY_DELETES: &str = "removed-equality-deletes";
+const REMOVED_FILE_SIZE: &str = "removed-files-size";
+const REMOVED_POSITION_DELETE_FILES: &str = "removed-position-delete-files";
+const REMOVED_POSITION_DELETES: &str = "removed-position-deletes";
+const TOTAL_DATA_FILES: &str = "total-data-files";
+const TOTAL_DELETE_FILES: &str = "total-delete-files";
+const TOTAL_EQUALITY_DELETES: &str = "total-equality-deletes";
+const TOTAL_FILE_SIZE: &str = "total-files-size";
+const TOTAL_POSITION_DELETES: &str = "total-position-deletes";
+const TOTAL_RECORDS: &str = "total-records";
+
+pub(crate) const ENTRIES_PROCESSED: &str = "entries-processed";
+pub(crate) const MANIFESTS_CREATED: &str = "manifests-created";
+pub(crate) const MANIFESTS_KEPT: &str = "manifests-kept";
+pub(crate) const MANIFESTS_REPLACED: &str = "manifests-replaced";
 
 /// `SnapshotSummaryCollector` collects and aggregates snapshot update metrics.
 /// It gathers metrics about added or removed data files and manifests, and tracks
@@ -334,18 +339,6 @@ pub(crate) fn update_snapshot_summaries(
     previous_summary: Option<&Summary>,
     truncate_full_table: bool,
 ) -> Result<Summary> {
-    // Validate that the operation is supported
-    if summary.operation != Operation::Append
-        && summary.operation != Operation::Overwrite
-        && summary.operation != Operation::Delete
-        && summary.operation != Operation::Replace
-    {
-        return Err(Error::new(
-            ErrorKind::DataInvalid,
-            "Operation is not supported.",
-        ));
-    }
-
     let mut summary = match previous_summary {
         Some(prev_summary) if truncate_full_table && summary.operation == Operation::Overwrite => {
             truncate_table_summary(summary, prev_summary).map_err(|err| {

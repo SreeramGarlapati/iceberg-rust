@@ -25,7 +25,8 @@ use uuid::Uuid;
 
 use crate::error::Result;
 use crate::spec::{
-    DataFile, FormatVersion, ManifestContentType, ManifestEntry, ManifestFile, Operation, Struct,
+    DataFile, ENTRIES_PROCESSED, FormatVersion, MANIFESTS_CREATED, MANIFESTS_KEPT,
+    MANIFESTS_REPLACED, ManifestContentType, ManifestEntry, ManifestFile, Operation, Struct,
     TableProperties,
 };
 use crate::table::Table;
@@ -298,31 +299,19 @@ impl ManifestProcess for RewriteManifestsProcess {
             new_manifests.push(written);
         }
 
-        let summary_properties = HashMap::from([
-            (
-                "manifests-created".to_string(),
-                new_manifests.len().to_string(),
-            ),
-            (
-                "manifests-replaced".to_string(),
-                self.to_rewrite.len().to_string(),
-            ),
-            ("manifests-kept".to_string(), kept.len().to_string()),
-            (
-                "entries-processed".to_string(),
-                entries_processed.to_string(),
-            ),
-        ]);
+        let manifests_created = new_manifests.len();
+        let manifests_kept = kept.len();
 
         // New manifests first, then the untouched ones, matching the order of
         // the previous standalone commit path.
         let mut manifests = new_manifests;
         manifests.extend(kept);
 
-        Ok(ProcessedManifests {
-            manifests,
-            summary_properties,
-        })
+        Ok(ProcessedManifests::new(manifests)
+            .with_property(MANIFESTS_CREATED, manifests_created)
+            .with_property(MANIFESTS_REPLACED, self.to_rewrite.len())
+            .with_property(MANIFESTS_KEPT, manifests_kept)
+            .with_property(ENTRIES_PROCESSED, entries_processed))
     }
 }
 
