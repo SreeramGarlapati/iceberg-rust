@@ -338,6 +338,7 @@ pub(crate) fn update_snapshot_summaries(
     if summary.operation != Operation::Append
         && summary.operation != Operation::Overwrite
         && summary.operation != Operation::Delete
+        && summary.operation != Operation::Replace
     {
         return Err(Error::new(
             ErrorKind::DataInvalid,
@@ -615,6 +616,43 @@ mod tests {
                 .unwrap(),
             "4"
         );
+    }
+
+    #[test]
+    fn test_update_snapshot_summaries_replace_carries_totals_forward() {
+        // A Replace operation (e.g. rewrite-manifests) adds and removes no
+        // data, so every total must carry forward from the previous snapshot
+        // unchanged.
+        let prev_props: HashMap<String, String> = [
+            (TOTAL_DATA_FILES.to_string(), "10".to_string()),
+            (TOTAL_DELETE_FILES.to_string(), "5".to_string()),
+            (TOTAL_RECORDS.to_string(), "100".to_string()),
+            (TOTAL_FILE_SIZE.to_string(), "1000".to_string()),
+            (TOTAL_POSITION_DELETES.to_string(), "3".to_string()),
+            (TOTAL_EQUALITY_DELETES.to_string(), "2".to_string()),
+        ]
+        .into_iter()
+        .collect();
+
+        let previous_summary = Summary {
+            operation: Operation::Append,
+            additional_properties: prev_props.clone(),
+        };
+
+        let summary = Summary {
+            operation: Operation::Replace,
+            additional_properties: HashMap::new(),
+        };
+
+        let updated = update_snapshot_summaries(summary, Some(&previous_summary), false).unwrap();
+
+        for (key, value) in &prev_props {
+            assert_eq!(
+                updated.additional_properties.get(key).unwrap(),
+                value,
+                "total {key} must be unchanged by a Replace operation"
+            );
+        }
     }
 
     #[test]

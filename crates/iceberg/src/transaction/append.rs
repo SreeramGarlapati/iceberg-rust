@@ -28,6 +28,7 @@ use crate::transaction::snapshot::{
     DefaultManifestProcess, SnapshotProduceOperation, SnapshotProducer,
 };
 use crate::transaction::{ActionCommit, TransactionAction};
+use crate::{Error, ErrorKind};
 
 /// FastAppendAction is a transaction action for fast append data files to the table.
 pub struct FastAppendAction {
@@ -84,6 +85,18 @@ impl FastAppendAction {
 #[async_trait]
 impl TransactionAction for FastAppendAction {
     async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
+        // Assert the action would add new content to the new snapshot.
+        //
+        // TODO: Allowing snapshot property setup with no added data files is a workaround.
+        // We should clean it up after all necessary actions are supported.
+        // For details, please refer to https://github.com/apache/iceberg-rust/issues/1548
+        if self.added_data_files.is_empty() && self.snapshot_properties.is_empty() {
+            return Err(Error::new(
+                ErrorKind::PreconditionFailed,
+                "No added data files or added snapshot properties found when write a manifest file",
+            ));
+        }
+
         let snapshot_producer = SnapshotProducer::new(
             table,
             self.commit_uuid.unwrap_or_else(Uuid::now_v7),

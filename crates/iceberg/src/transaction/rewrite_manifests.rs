@@ -25,14 +25,15 @@ use uuid::Uuid;
 
 use crate::error::Result;
 use crate::spec::{
-    DataFile, DataFileFormat, FormatVersion, MAIN_BRANCH, ManifestContentType, ManifestFile,
-    ManifestListWriter, ManifestWriter, ManifestWriterBuilder, Operation, Snapshot,
-    SnapshotReference, SnapshotRetention, Struct, Summary, TableProperties,
+    DataFile, FormatVersion, ManifestContentType, ManifestEntry, ManifestFile, Operation, Struct,
+    TableProperties,
 };
 use crate::table::Table;
-use crate::transaction::snapshot::generate_unique_snapshot_id;
+use crate::transaction::snapshot::{
+    ManifestProcess, ProcessedManifests, SnapshotProduceOperation, SnapshotProducer,
+};
 use crate::transaction::{ActionCommit, TransactionAction};
-use crate::{Error, ErrorKind, TableRequirement, TableUpdate};
+use crate::{Error, ErrorKind};
 
 const FALLBACK_BYTES_PER_ENTRY: u64 = 256;
 
@@ -79,7 +80,6 @@ impl TransactionAction for RewriteManifestsAction {
                 .unwrap_or(TableProperties::PROPERTY_COMMIT_MANIFEST_TARGET_SIZE_BYTES_DEFAULT)
         });
         let default_spec_id = metadata.default_partition_spec_id();
-        let format_version = metadata.format_version();
 
         let manifest_list = table.manifest_list_reader(current_snapshot).load().await?;
 
@@ -111,26 +111,115 @@ impl TransactionAction for RewriteManifestsAction {
         let bytes_per_entry = total_size
             .checked_div(total_input_entries)
             .map_or(FALLBACK_BYTES_PER_ENTRY, |b| b.max(1));
-        let manifests_replaced = to_rewrite.len();
 
-        let commit_uuid = Uuid::now_v7();
-        let snapshot_id = generate_unique_snapshot_id(table);
+        let producer = SnapshotProducer::new(
+            table,
+            Uuid::now_v7(),
+            None,
+            self.snapshot_properties.clone(),
+            vec![],
+        );
+        producer
+            .commit(
+                RewriteManifestsOperation { kept },
+                RewriteManifestsProcess {
+                    to_rewrite,
+                    target_size_bytes,
+                    bytes_per_entry,
+                },
+            )
+            .await
+    }
+}
 
-        let loaded: Vec<_> = stream::iter(to_rewrite)
+/// Emits a `Replace` snapshot. The manifests the rewrite leaves untouched are
+/// carried forward here; the rewritten ones are produced by
+/// [`RewriteManifestsProcess`].
+struct RewriteManifestsOperation {
+    kept: Vec<ManifestFile>,
+}
+
+impl SnapshotProduceOperation for RewriteManifestsOperation {
+    fn operation(&self) -> Operation {
+        Operation::Replace
+    }
+
+    async fn delete_entries(
+        &self,
+        _snapshot_produce: &SnapshotProducer<'_>,
+    ) -> Result<Vec<ManifestEntry>> {
+        Ok(vec![])
+    }
+
+    async fn existing_manifest(
+        &self,
+        _snapshot_produce: &SnapshotProducer<'_>,
+    ) -> Result<Vec<ManifestFile>> {
+        Ok(self.kept.clone())
+    }
+}
+
+/// Rewrites the selected manifests into new ones rolled by target size,
+/// grouping live entries by partition tuple and preserving their
+/// `sequence_number`, `file_sequence_number`, and (v3) `first_row_id`.
+struct RewriteManifestsProcess {
+    to_rewrite: Vec<ManifestFile>,
+    target_size_bytes: u64,
+    bytes_per_entry: u64,
+}
+
+/// A live entry lifted out of a source manifest, carrying the fields
+/// [`ManifestWriter::add_existing_file`] needs to re-emit it.
+///
+/// [`ManifestWriter::add_existing_file`]: crate::spec::ManifestWriter::add_existing_file
+struct ExistingEntry {
+    data_file: DataFile,
+    snapshot_id: i64,
+    sequence_number: i64,
+    file_sequence_number: Option<i64>,
+}
+
+impl ManifestProcess for RewriteManifestsProcess {
+    async fn process_manifests(
+        &self,
+        snapshot_produce: &SnapshotProducer<'_>,
+        kept: Vec<ManifestFile>,
+    ) -> Result<ProcessedManifests> {
+        let table = snapshot_produce.table;
+        let format_version = table.metadata().format_version();
+
+        let loaded: Vec<_> = stream::iter(self.to_rewrite.clone())
             .map(|m| {
                 let file_io = table.file_io().clone();
-                async move { m.load_manifest(&file_io).await }
+                async move {
+                    let manifest = m.load_manifest(&file_io).await?;
+                    Ok::<_, Error>((m, manifest))
+                }
             })
             .buffer_unordered(16)
             .try_collect()
             .await?;
 
-        let mut grouped: Vec<Vec<(DataFile, i64, i64, Option<i64>)>> = Vec::new();
+        let mut grouped: Vec<Vec<ExistingEntry>> = Vec::new();
         let mut group_index: HashMap<Struct, usize> = HashMap::new();
         let mut entries_processed: u64 = 0;
 
-        for manifest in loaded {
+        for (manifest_file, manifest) in loaded {
+            // Per the v3 first-row-id inheritance rules, an entry with a null
+            // `first_row_id` derives it from the manifest's `first_row_id`
+            // plus the record counts of the null-`first_row_id` entries that
+            // precede it. The derived value must be written explicitly when
+            // the entry is copied into a new manifest, where the original
+            // base is no longer available.
+            let mut inherited_row_id = manifest_file.first_row_id.map(|v| v as i64);
             for entry in manifest.entries() {
+                let entry_first_row_id = entry.data_file().first_row_id;
+                let effective_first_row_id = entry_first_row_id.or(inherited_row_id);
+                if entry_first_row_id.is_none()
+                    && let Some(base) = inherited_row_id.as_mut()
+                {
+                    *base += entry.data_file().record_count() as i64;
+                }
                 if !entry.is_alive() {
                     continue;
                 }
@@ -146,7 +235,8 @@ impl TransactionAction for RewriteManifestsAction {
                         "Live manifest entry is missing sequence_number",
                     )
                 })?;
-                let data_file = entry.data_file().clone();
+                let mut data_file = entry.data_file().clone();
+                data_file.first_row_id = effective_first_row_id;
                 let idx = match group_index.get(&data_file.partition) {
                     Some(&i) => i,
                     None => {
@@ -156,39 +246,50 @@ impl TransactionAction for RewriteManifestsAction {
                         i
                     }
                 };
-                grouped[idx].push((data_file, snap_id, seq, entry.file_sequence_number));
+                grouped[idx].push(ExistingEntry {
+                    data_file,
+                    snapshot_id: snap_id,
+                    sequence_number: seq,
+                    file_sequence_number: entry.file_sequence_number,
+                });
                 entries_processed += 1;
             }
         }
 
-        let mut counter: u64 = 0;
         let mut new_manifests: Vec<ManifestFile> = Vec::with_capacity(grouped.len());
 
         for group in grouped {
-            let mut writer = new_manifest_writer(table, &commit_uuid, counter, snapshot_id)?;
-            counter += 1;
+            let mut writer = snapshot_produce.new_manifest_writer(ManifestContentType::Data)?;
             let mut accumulated: u64 = 0;
             let mut min_first_row_id: Option<u64> = None;
 
-            for (data_file, snap_id, seq, file_seq) in group {
+            for entry in group {
                 if accumulated > 0
-                    && accumulated.saturating_add(bytes_per_entry) > target_size_bytes
+                    && accumulated.saturating_add(self.bytes_per_entry) > self.target_size_bytes
                 {
                     let mut written = writer.write_manifest_file().await?;
                     if format_version == FormatVersion::V3 {
                         written.first_row_id = min_first_row_id;
                     }
                     new_manifests.push(written);
-                    writer = new_manifest_writer(table, &commit_uuid, counter, snapshot_id)?;
-                    counter += 1;
+                    writer = snapshot_produce.new_manifest_writer(ManifestContentType::Data)?;
                     accumulated = 0;
                     min_first_row_id = None;
                 }
-                if let Some(frid_u) = data_file.first_row_id.and_then(|f| u64::try_from(f).ok()) {
+                if let Some(frid_u) = entry
+                    .data_file
+                    .first_row_id
+                    .and_then(|f| u64::try_from(f).ok())
+                {
                     min_first_row_id = Some(min_first_row_id.map_or(frid_u, |m| m.min(frid_u)));
                 }
-                writer.add_existing_file(data_file, snap_id, seq, file_seq)?;
-                accumulated = accumulated.saturating_add(bytes_per_entry);
+                writer.add_existing_file(
+                    entry.data_file,
+                    entry.snapshot_id,
+                    entry.sequence_number,
+                    entry.file_sequence_number,
+                )?;
+                accumulated = accumulated.saturating_add(self.bytes_per_entry);
             }
             let mut written = writer.write_manifest_file().await?;
             if format_version == FormatVersion::V3 {
@@ -197,140 +298,32 @@ impl TransactionAction for RewriteManifestsAction {
             new_manifests.push(written);
         }
 
-        let manifest_list_path = format!(
-            "{}/metadata/snap-{}-0-{}.{}",
-            metadata.location(),
-            snapshot_id,
-            commit_uuid,
-            DataFileFormat::Avro,
-        );
-        let next_seq_num = metadata.next_sequence_number();
-        let next_row_id = metadata.next_row_id();
-        let writer = table
-            .file_io()
-            .new_output(manifest_list_path.clone())?
-            .writer()
-            .await?;
-        let mut list_writer = match format_version {
-            FormatVersion::V1 => {
-                ManifestListWriter::v1(writer, snapshot_id, metadata.current_snapshot_id())
-            }
-            FormatVersion::V2 => ManifestListWriter::v2(
-                writer,
-                snapshot_id,
-                metadata.current_snapshot_id(),
-                next_seq_num,
+        let summary_properties = HashMap::from([
+            (
+                "manifests-created".to_string(),
+                new_manifests.len().to_string(),
             ),
-            FormatVersion::V3 => ManifestListWriter::v3(
-                writer,
-                snapshot_id,
-                metadata.current_snapshot_id(),
-                next_seq_num,
-                Some(next_row_id),
+            (
+                "manifests-replaced".to_string(),
+                self.to_rewrite.len().to_string(),
             ),
-        };
-        let manifests_created = new_manifests.len();
-        let manifests_kept = kept.len();
-        list_writer.add_manifests(new_manifests.into_iter().chain(kept))?;
-        list_writer.close().await?;
+            ("manifests-kept".to_string(), kept.len().to_string()),
+            (
+                "entries-processed".to_string(),
+                entries_processed.to_string(),
+            ),
+        ]);
 
-        let mut additional_properties: HashMap<String, String> = self.snapshot_properties.clone();
-        for k in [
-            "total-data-files",
-            "total-delete-files",
-            "total-records",
-            "total-files-size",
-            "total-position-deletes",
-            "total-equality-deletes",
-        ] {
-            if let Some(v) = current_snapshot.summary().additional_properties.get(k) {
-                additional_properties.insert(k.to_string(), v.clone());
-            }
-        }
-        additional_properties.insert(
-            "manifests-created".to_string(),
-            manifests_created.to_string(),
-        );
-        additional_properties.insert(
-            "manifests-replaced".to_string(),
-            manifests_replaced.to_string(),
-        );
-        additional_properties.insert("manifests-kept".to_string(), manifests_kept.to_string());
-        additional_properties.insert(
-            "entries-processed".to_string(),
-            entries_processed.to_string(),
-        );
-        let summary = Summary {
-            operation: Operation::Replace,
-            additional_properties,
-        };
+        // New manifests first, then the untouched ones, matching the order of
+        // the previous standalone commit path.
+        let mut manifests = new_manifests;
+        manifests.extend(kept);
 
-        let commit_ts = chrono::Utc::now().timestamp_millis();
-        let snapshot_builder = Snapshot::builder()
-            .with_manifest_list(manifest_list_path)
-            .with_snapshot_id(snapshot_id)
-            .with_parent_snapshot_id(metadata.current_snapshot_id())
-            .with_sequence_number(next_seq_num)
-            .with_summary(summary)
-            .with_schema_id(metadata.current_schema_id())
-            .with_timestamp_ms(commit_ts);
-        let new_snapshot = match format_version {
-            FormatVersion::V3 => snapshot_builder.with_row_range(next_row_id, 0).build(),
-            _ => snapshot_builder.build(),
-        };
-
-        let updates = vec![
-            TableUpdate::AddSnapshot {
-                snapshot: new_snapshot,
-            },
-            TableUpdate::SetSnapshotRef {
-                ref_name: MAIN_BRANCH.to_string(),
-                reference: SnapshotReference::new(
-                    snapshot_id,
-                    SnapshotRetention::branch(None, None, None),
-                ),
-            },
-        ];
-        let requirements = vec![
-            TableRequirement::UuidMatch {
-                uuid: metadata.uuid(),
-            },
-            TableRequirement::RefSnapshotIdMatch {
-                r#ref: MAIN_BRANCH.to_string(),
-                snapshot_id: metadata.current_snapshot_id(),
-            },
-        ];
-        Ok(ActionCommit::new(updates, requirements))
+        Ok(ProcessedManifests {
+            manifests,
+            summary_properties,
+        })
     }
-}
-
-fn new_manifest_writer(
-    table: &Table,
-    commit_uuid: &Uuid,
-    n: u64,
-    snapshot_id: i64,
-) -> Result<ManifestWriter> {
-    let metadata = table.metadata();
-    let path = format!(
-        "{}/metadata/{}-m{}.{}",
-        metadata.location(),
-        commit_uuid,
-        n,
-        DataFileFormat::Avro,
-    );
-    let output = table.file_io().new_output(path)?;
-    let builder = ManifestWriterBuilder::new(
-        output,
-        Some(snapshot_id),
-        None,
-        metadata.current_schema().clone(),
-        metadata.default_partition_spec().as_ref().clone(),
-    );
-    Ok(match metadata.format_version() {
-        FormatVersion::V1 => builder.build_v1(),
-        FormatVersion::V2 => builder.build_v2_data(),
-        FormatVersion::V3 => builder.build_v3_data(),
-    })
 }
 
 #[cfg(test)]
@@ -629,6 +622,10 @@ mod tests {
         let table = append_one(&catalog, table, data_file("b", 1, 100, 17)).await;
         let table = append_one(&catalog, table, data_file("c", 1, 100, 11)).await;
 
+        /// Collects each live entry's (path, effective first_row_id, sequence
+        /// numbers), deriving null `first_row_id`s from the manifest's base
+        /// per the v3 inheritance rules, so entries compare by their logical
+        /// row ids whether stored explicitly or inherited.
         async fn collect(t: &Table) -> Vec<(String, Option<i64>, Option<i64>, Option<i64>)> {
             let list = t
                 .manifest_list_reader(t.metadata().current_snapshot().unwrap())
@@ -638,10 +635,18 @@ mod tests {
             let mut v = Vec::new();
             for m in list.entries() {
                 let manifest = m.load_manifest(t.file_io()).await.unwrap();
+                let mut inherited_row_id = m.first_row_id.map(|b| b as i64);
                 for entry in manifest.entries() {
+                    let entry_first_row_id = entry.data_file().first_row_id;
+                    let effective_first_row_id = entry_first_row_id.or(inherited_row_id);
+                    if entry_first_row_id.is_none()
+                        && let Some(base) = inherited_row_id.as_mut()
+                    {
+                        *base += entry.data_file().record_count() as i64;
+                    }
                     v.push((
                         entry.data_file().file_path().to_string(),
-                        entry.data_file().first_row_id,
+                        effective_first_row_id,
                         entry.sequence_number(),
                         entry.file_sequence_number,
                     ));
@@ -801,5 +806,120 @@ mod tests {
                 "all entries within a manifest share one partition tuple"
             );
         }
+    }
+
+    /// Returns each live entry's explicitly stored `first_row_id`, keyed by
+    /// file path, asserting along the way that every rewritten entry stores
+    /// one and that each manifest's `first_row_id` is the minimum of its
+    /// entries' values (so the manifest-list writer never assigns the
+    /// manifest a fresh row range).
+    async fn explicit_row_ids_by_path(table: &Table) -> HashMap<String, i64> {
+        let snap = table.metadata().current_snapshot().unwrap();
+        let list = table.manifest_list_reader(snap).load().await.unwrap();
+        let mut by_path = HashMap::new();
+        for m in list.entries() {
+            let manifest = m.load_manifest(table.file_io()).await.unwrap();
+            let mut min_row_id: Option<i64> = None;
+            for entry in manifest.entries() {
+                let row_id = entry.data_file().first_row_id.expect(
+                    "rewritten entries must store first_row_id explicitly; the new manifest \
+                     provides no base to re-derive them from",
+                );
+                min_row_id = Some(min_row_id.map_or(row_id, |v| v.min(row_id)));
+                by_path.insert(entry.data_file().file_path().to_string(), row_id);
+            }
+            assert_eq!(
+                m.first_row_id,
+                min_row_id.map(|v| v as u64),
+                "a rewritten manifest's first_row_id must be the minimum of its entries' \
+                 explicit values"
+            );
+        }
+        by_path
+    }
+
+    #[tokio::test]
+    async fn test_rewrite_materializes_inherited_first_row_ids() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let base = table.metadata().next_row_id() as i64;
+
+        // A single fast-append of several files produces one manifest whose
+        // entries all store a null `first_row_id`: each entry's logical value
+        // is derived on read from the manifest's `first_row_id` plus the
+        // record counts of the null entries preceding it (a: base, b: base+10,
+        // c: base+30).
+        let tx = Transaction::new(&table);
+        let table = tx
+            .fast_append()
+            .add_data_files(vec![
+                data_file("a", 1, 100, 10),
+                data_file("b", 1, 100, 20),
+                data_file("c", 1, 100, 30),
+            ])
+            .apply(tx)
+            .unwrap()
+            .commit(&catalog)
+            .await
+            .unwrap();
+        // A second manifest so the rewrite is not a single-manifest no-op.
+        let table = append_one(&catalog, table, data_file("d", 1, 100, 5)).await;
+        let next_row_id_before = table.metadata().next_row_id();
+
+        // Sanity-check the setup: the source entries rely on inheritance, so
+        // a rewrite that failed to materialize their `first_row_id` would
+        // silently change the rows' logical ids.
+        let pre_list = table
+            .manifest_list_reader(table.metadata().current_snapshot().unwrap())
+            .load()
+            .await
+            .unwrap();
+        for m in pre_list.entries() {
+            assert!(m.first_row_id.is_some());
+            let manifest = m.load_manifest(table.file_io()).await.unwrap();
+            for entry in manifest.entries() {
+                assert!(entry.data_file().first_row_id.is_none());
+            }
+        }
+
+        let tx = Transaction::new(&table);
+        let table = tx
+            .rewrite_manifests()
+            .apply(tx)
+            .unwrap()
+            .commit(&catalog)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            table.metadata().next_row_id(),
+            next_row_id_before,
+            "rewrite must not consume new row ids"
+        );
+        let mut expected: HashMap<String, i64> = HashMap::from([
+            ("test/a.parquet".to_string(), base),
+            ("test/b.parquet".to_string(), base + 10),
+            ("test/c.parquet".to_string(), base + 30),
+            ("test/d.parquet".to_string(), base + 60),
+        ]);
+        assert_eq!(explicit_row_ids_by_path(&table).await, expected);
+
+        // A second rewrite consolidates a mix of explicit entries (from the
+        // first rewrite) and a null entry (from a fresh append): explicit
+        // values must be taken as stored, never re-derived or re-assigned.
+        let table = append_one(&catalog, table, data_file("e", 1, 100, 7)).await;
+        let next_row_id_before = table.metadata().next_row_id();
+        let tx = Transaction::new(&table);
+        let table = tx
+            .rewrite_manifests()
+            .apply(tx)
+            .unwrap()
+            .commit(&catalog)
+            .await
+            .unwrap();
+
+        assert_eq!(table.metadata().next_row_id(), next_row_id_before);
+        expected.insert("test/e.parquet".to_string(), base + 65);
+        assert_eq!(explicit_row_ids_by_path(&table).await, expected);
     }
 }
