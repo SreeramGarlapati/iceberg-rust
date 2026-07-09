@@ -25,28 +25,33 @@ use crate::{Error, ErrorKind, Result};
 
 const ADDED_DATA_FILES: &str = "added-data-files";
 const ADDED_DELETE_FILES: &str = "added-delete-files";
+const ADDED_EQUALITY_DELETE_FILES: &str = "added-equality-delete-files";
 const ADDED_EQUALITY_DELETES: &str = "added-equality-deletes";
 const ADDED_FILE_SIZE: &str = "added-files-size";
-const ADDED_POSITION_DELETES: &str = "added-position-deletes";
 const ADDED_POSITION_DELETE_FILES: &str = "added-position-delete-files";
+const ADDED_POSITION_DELETES: &str = "added-position-deletes";
 const ADDED_RECORDS: &str = "added-records";
-const DELETED_DATA_FILES: &str = "deleted-data-files";
-const DELETED_RECORDS: &str = "deleted-records";
-const ADDED_EQUALITY_DELETE_FILES: &str = "added-equality-delete-files";
-const REMOVED_DELETE_FILES: &str = "removed-delete-files";
-const REMOVED_EQUALITY_DELETES: &str = "removed-equality-deletes";
-const REMOVED_EQUALITY_DELETE_FILES: &str = "removed-equality-delete-files";
-const REMOVED_FILE_SIZE: &str = "removed-files-size";
-const REMOVED_POSITION_DELETES: &str = "removed-position-deletes";
-const REMOVED_POSITION_DELETE_FILES: &str = "removed-position-delete-files";
-const TOTAL_EQUALITY_DELETES: &str = "total-equality-deletes";
-const TOTAL_POSITION_DELETES: &str = "total-position-deletes";
-const TOTAL_DATA_FILES: &str = "total-data-files";
-const TOTAL_DELETE_FILES: &str = "total-delete-files";
-const TOTAL_RECORDS: &str = "total-records";
-const TOTAL_FILE_SIZE: &str = "total-files-size";
 const CHANGED_PARTITION_COUNT_PROP: &str = "changed-partition-count";
 const CHANGED_PARTITION_PREFIX: &str = "partitions.";
+const DELETED_DATA_FILES: &str = "deleted-data-files";
+const DELETED_RECORDS: &str = "deleted-records";
+const REMOVED_DELETE_FILES: &str = "removed-delete-files";
+const REMOVED_EQUALITY_DELETE_FILES: &str = "removed-equality-delete-files";
+const REMOVED_EQUALITY_DELETES: &str = "removed-equality-deletes";
+const REMOVED_FILE_SIZE: &str = "removed-files-size";
+const REMOVED_POSITION_DELETE_FILES: &str = "removed-position-delete-files";
+const REMOVED_POSITION_DELETES: &str = "removed-position-deletes";
+const TOTAL_DATA_FILES: &str = "total-data-files";
+const TOTAL_DELETE_FILES: &str = "total-delete-files";
+const TOTAL_EQUALITY_DELETES: &str = "total-equality-deletes";
+const TOTAL_FILE_SIZE: &str = "total-files-size";
+const TOTAL_POSITION_DELETES: &str = "total-position-deletes";
+const TOTAL_RECORDS: &str = "total-records";
+
+pub(crate) const ENTRIES_PROCESSED: &str = "entries-processed";
+pub(crate) const MANIFESTS_CREATED: &str = "manifests-created";
+pub(crate) const MANIFESTS_KEPT: &str = "manifests-kept";
+pub(crate) const MANIFESTS_REPLACED: &str = "manifests-replaced";
 
 /// `SnapshotSummaryCollector` collects and aggregates snapshot update metrics.
 /// It gathers metrics about added or removed data files and manifests, and tracks
@@ -334,17 +339,6 @@ pub(crate) fn update_snapshot_summaries(
     previous_summary: Option<&Summary>,
     truncate_full_table: bool,
 ) -> Result<Summary> {
-    // Validate that the operation is supported
-    if summary.operation != Operation::Append
-        && summary.operation != Operation::Overwrite
-        && summary.operation != Operation::Delete
-    {
-        return Err(Error::new(
-            ErrorKind::DataInvalid,
-            "Operation is not supported.",
-        ));
-    }
-
     let mut summary = match previous_summary {
         Some(prev_summary) if truncate_full_table && summary.operation == Operation::Overwrite => {
             truncate_table_summary(summary, prev_summary).map_err(|err| {
@@ -615,6 +609,43 @@ mod tests {
                 .unwrap(),
             "4"
         );
+    }
+
+    #[test]
+    fn test_update_snapshot_summaries_replace_carries_totals_forward() {
+        // A Replace operation (e.g. rewrite-manifests) adds and removes no
+        // data, so every total must carry forward from the previous snapshot
+        // unchanged.
+        let prev_props: HashMap<String, String> = [
+            (TOTAL_DATA_FILES.to_string(), "10".to_string()),
+            (TOTAL_DELETE_FILES.to_string(), "5".to_string()),
+            (TOTAL_RECORDS.to_string(), "100".to_string()),
+            (TOTAL_FILE_SIZE.to_string(), "1000".to_string()),
+            (TOTAL_POSITION_DELETES.to_string(), "3".to_string()),
+            (TOTAL_EQUALITY_DELETES.to_string(), "2".to_string()),
+        ]
+        .into_iter()
+        .collect();
+
+        let previous_summary = Summary {
+            operation: Operation::Append,
+            additional_properties: prev_props.clone(),
+        };
+
+        let summary = Summary {
+            operation: Operation::Replace,
+            additional_properties: HashMap::new(),
+        };
+
+        let updated = update_snapshot_summaries(summary, Some(&previous_summary), false).unwrap();
+
+        for (key, value) in &prev_props {
+            assert_eq!(
+                updated.additional_properties.get(key).unwrap(),
+                value,
+                "total {key} must be unchanged by a Replace operation"
+            );
+        }
     }
 
     #[test]
